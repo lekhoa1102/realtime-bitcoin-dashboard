@@ -44,84 +44,166 @@ st.set_page_config(
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# WEBSOCKET STREAM
+# --------------------------------------------------------------------------
+
 class BinanceStream:
     def __init__(self, maxlen=BUFFER_MAXLEN):
         self.trades = deque(maxlen=maxlen)
-        self.connection_status = {"connected": False, "last_update": None}
-        self._ws = None
-        self._thread = None
+
+        self.connection_status = {
+            "connected": False,
+            "last_update": None,
+            "error": None
+        }
+
         self._lock = threading.Lock()
+        self._thread = None
         self._stop = False
 
     def _on_message(self, ws, message):
         try:
             data = json.loads(message)
+
             trade = {
-                "time": datetime.fromtimestamp(data["T"] / 1000, tz=timezone.utc),
+                "time": datetime.fromtimestamp(
+                    data["T"] / 1000,
+                    tz=timezone.utc
+                ),
                 "price": float(data["p"]),
                 "quantity": float(data["q"]),
-                "trade_id": data["a"],
+                "trade_id": data["a"]
             }
+
             with self._lock:
                 self.trades.append(trade)
-                self.connection_status["last_update"] = datetime.now(timezone.utc)
+                self.connection_status["last_update"] = datetime.now(
+                    timezone.utc
+                )
+                self.connection_status["error"] = None
+
         except Exception as e:
-            print("Parse error:", e)
+            with self._lock:
+                self.connection_status["error"] = f"Parse error: {e}"
 
     def _on_open(self, ws):
-        print("WebSocket connected.")
-        self.connection_status["connected"] = True
+        with self._lock:
+            self.connection_status["connected"] = True
+            self.connection_status["error"] = None
+
+        print("WebSocket connected.", flush=True)
 
     def _on_close(self, ws, close_status_code, close_msg):
-        print("WebSocket closed:", close_status_code, close_msg)
-        self.connection_status["connected"] = False
+        with self._lock:
+            self.connection_status["connected"] = False
+
+        print(
+            f"WebSocket closed: {close_status_code} - {close_msg}",
+            flush=True
+        )
 
     def _on_error(self, ws, error):
-        print("WebSocket error:", error)
-        self.connection_status["connected"] = False
+        with self._lock:
+            self.connection_status["connected"] = False
+            self.connection_status["error"] = str(error)
+
+        print(f"WebSocket error: {error}", flush=True)
 
     def _run_forever(self):
+        print("Starting WebSocket worker...", flush=True)
+
         while not self._stop:
+
             try:
-                self._ws = websocket.WebSocketApp(
-                    WS_URL,
-                    on_message=self._on_message,
-                    on_open=self._on_open,
-                    on_close=self._on_close,
-                    on_error=self._on_error,
+                print(
+                    f"Connecting to Binance: {WS_URL}",
+                    flush=True
                 )
-                self._ws.run_forever(ping_interval=20, ping_timeout=10)
+
+                ws = websocket.WebSocketApp(
+                    WS_URL,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close
+                )
+
+                ws.run_forever(
+                    ping_interval=20,
+                    ping_timeout=10
+                )
+
             except Exception as e:
-                print("Reconnect after error:", e)
+
+                with self._lock:
+                    self.connection_status["connected"] = False
+                    self.connection_status["error"] = str(e)
+
+                print(
+                    f"WebSocket worker exception: {e}",
+                    flush=True
+                )
+
             if not self._stop:
-                time.sleep(3)
+                print(
+                    "Retrying WebSocket connection in 5 seconds...",
+                    flush=True
+                )
+
+                time.sleep(5)
 
     def start(self):
-        if self._thread is None or not self._thread.is_alive():
-            self._stop = False
-            self._thread = threading.Thread(target=self._run_forever, daemon=True)
-            self._thread.start()
+
+        if self._thread is not None and self._thread.is_alive():
+            return
+
+        self._stop = False
+
+        self._thread = threading.Thread(
+            target=self._run_forever,
+            daemon=True,
+            name="BinanceWebSocket"
+        )
+
+        self._thread.start()
+
+        print(
+            "WebSocket background thread started.",
+            flush=True
+        )
 
     def get_trades_df(self):
+
         with self._lock:
             data = list(self.trades)
+
         if not data:
-            return pd.DataFrame(columns=["time", "price", "quantity", "trade_id"])
+            return pd.DataFrame(
+                columns=[
+                    "time",
+                    "price",
+                    "quantity",
+                    "trade_id"
+                ]
+            )
+
         return pd.DataFrame(data)
+
+    def get_status(self):
+
+        with self._lock:
+            return dict(self.connection_status)
 
 
 @st.cache_resource
 def get_stream():
-    """
-    st.cache_resource ensures ONE BinanceStream instance (and one background
-    thread) lives for the whole server process, shared across all viewers
-    and reruns -- instead of opening a new WebSocket connection every time
-    Streamlit reruns the script (which happens every refresh).
-    """
-    s = BinanceStream()
-    s.start()
-    return s
 
+    stream = BinanceStream()
+
+    stream.start()
+
+    return stream
 
 # --------------------------------------------------------------------------
 # DATA PROCESSING
@@ -261,8 +343,13 @@ def render_dashboard():
     df = stream.get_trades_df()
     ohlc_df = compute_ohlc(df)
     kpis = compute_kpis(df, ohlc_df)
-    connected = stream.connection_status["connected"]
+    status = stream.get_status()
 
+    connected = status["connected"]
+    if status["error"]:
+        st.warning(
+            f"WebSocket error: {status['error']}"
+        )
     # ---- KPI CARDS ----
     col1, col2, col3 = st.columns(3)
 
