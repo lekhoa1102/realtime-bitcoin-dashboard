@@ -1,6 +1,6 @@
 """
 Real-Time Bitcoin Market Monitoring and Visualization System
-BTC/USDT live data via Binance Spot WebSocket -> Streamlit dashboard.
+BTC/USD live data via Coinbase Advanced Trade WebSocket -> Streamlit dashboard.
 
 Pipeline:
 Binance WebSocket -> Real-Time Data Processing -> Time-based Aggregation (OHLC)
@@ -23,7 +23,7 @@ import websocket  # websocket-client
 # CONFIG
 # --------------------------------------------------------------------------
 
-WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
+WS_URL = "wss://advanced-trade-ws.coinbase.com"
 BUFFER_MAXLEN = 1000
 REFRESH_SECONDS = 2          # redraw every 2s instead of 1s -> less flicker
 OHLC_FREQ = "1S"
@@ -34,7 +34,7 @@ COLOR_DOWN = "#DC2626"
 COLOR_BG = "#F8FAFC"
 
 st.set_page_config(
-    page_title="Real-Time BTC/USDT Dashboard",
+    page_title="Real-Time BTC/USD Dashboard",
     page_icon="\U0001F4C8",
     layout="wide",
 )
@@ -48,76 +48,115 @@ st.set_page_config(
 # WEBSOCKET STREAM
 # --------------------------------------------------------------------------
 
-class BinanceStream:
-    def __init__(self, maxlen=BUFFER_MAXLEN):
-        self.trades = deque(maxlen=maxlen)
+class CoinbaseStream:
+    def __init__(self):
+        self.trades = deque(maxlen=BUFFER_MAXLEN)
 
         self.connection_status = {
             "connected": False,
-            "last_update": None,
             "error": None
         }
 
-        self._lock = threading.Lock()
         self._thread = None
+        self._lock = threading.Lock()
         self._stop = False
 
     def _on_message(self, ws, message):
         try:
             data = json.loads(message)
 
-            trade = {
-                "time": datetime.fromtimestamp(
-                    data["T"] / 1000,
-                    tz=timezone.utc
-                ),
-                "price": float(data["p"]),
-                "quantity": float(data["q"]),
-                "trade_id": data["a"]
-            }
+            # Chỉ xử lý market_trades
+            if data.get("channel") != "market_trades":
+                return
 
-            with self._lock:
-                self.trades.append(trade)
-                self.connection_status["last_update"] = datetime.now(
-                    timezone.utc
-                )
-                self.connection_status["error"] = None
+            events = data.get("events", [])
+
+            for event in events:
+                trades = event.get("trades", [])
+
+                for trade in trades:
+                    try:
+                        timestamp = pd.to_datetime(
+                            trade["time"],
+                            utc=True
+                        )
+
+                        price = float(trade["price"])
+                        quantity = float(trade["size"])
+
+                        trade_id = trade.get("trade_id")
+                        side = trade.get("side", "UNKNOWN")
+
+                        record = {
+                            "time": timestamp,
+                            "price": price,
+                            "quantity": quantity,
+                            "trade_id": trade_id,
+                            "side": side
+                        }
+
+                        with self._lock:
+                            self.trades.append(record)
+
+                    except Exception as e:
+                        print(
+                            f"Trade parsing error: {e}",
+                            flush=True
+                        )
 
         except Exception as e:
-            with self._lock:
-                self.connection_status["error"] = f"Parse error: {e}"
+            print(
+                f"Message parsing error: {e}",
+                flush=True
+            )
 
     def _on_open(self, ws):
-        with self._lock:
-            self.connection_status["connected"] = True
-            self.connection_status["error"] = None
+        print(
+            "Connected to Coinbase WebSocket.",
+            flush=True
+        )
 
-        print("WebSocket connected.", flush=True)
+        self.connection_status["connected"] = True
+        self.connection_status["error"] = None
 
-    def _on_close(self, ws, close_status_code, close_msg):
-        with self._lock:
-            self.connection_status["connected"] = False
+        # Subscribe vào market_trades của BTC-USD
+        subscribe_message = {
+            "type": "subscribe",
+            "channel": "market_trades",
+            "product_ids": ["BTC-USD"]
+        }
+
+        ws.send(json.dumps(subscribe_message))
 
         print(
-            f"WebSocket closed: {close_status_code} - {close_msg}",
+            "Subscribed to BTC-USD market trades.",
             flush=True
         )
 
     def _on_error(self, ws, error):
-        with self._lock:
-            self.connection_status["connected"] = False
-            self.connection_status["error"] = str(error)
+        self.connection_status["connected"] = False
+        self.connection_status["error"] = str(error)
 
-        print(f"WebSocket error: {error}", flush=True)
+        print(
+            f"WebSocket error: {error}",
+            flush=True
+        )
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        self.connection_status["connected"] = False
+
+        print(
+            f"WebSocket closed: "
+            f"{close_status_code} - {close_msg}",
+            flush=True
+        )
 
     def _run_forever(self):
-        print("Starting WebSocket worker...", flush=True)
-
         while not self._stop:
 
             try:
                 print(
-                    f"Connecting to Binance: {WS_URL}",
+                    "Connecting to Coinbase...",
                     flush=True
                 )
 
@@ -135,10 +174,8 @@ class BinanceStream:
                 )
 
             except Exception as e:
-
-                with self._lock:
-                    self.connection_status["connected"] = False
-                    self.connection_status["error"] = str(e)
+                self.connection_status["connected"] = False
+                self.connection_status["error"] = str(e)
 
                 print(
                     f"WebSocket worker exception: {e}",
@@ -146,35 +183,24 @@ class BinanceStream:
                 )
 
             if not self._stop:
-                print(
-                    "Retrying WebSocket connection in 5 seconds...",
-                    flush=True
-                )
-
-                time.sleep(5)
+                time.sleep(3)
 
     def start(self):
+        if self._thread is None or not self._thread.is_alive():
 
-        if self._thread is not None and self._thread.is_alive():
-            return
+            print(
+                "Starting Coinbase WebSocket worker...",
+                flush=True
+            )
 
-        self._stop = False
+            self._thread = threading.Thread(
+                target=self._run_forever,
+                daemon=True
+            )
 
-        self._thread = threading.Thread(
-            target=self._run_forever,
-            daemon=True,
-            name="BinanceWebSocket"
-        )
-
-        self._thread.start()
-
-        print(
-            "WebSocket background thread started.",
-            flush=True
-        )
+            self._thread.start()
 
     def get_trades_df(self):
-
         with self._lock:
             data = list(self.trades)
 
@@ -184,26 +210,21 @@ class BinanceStream:
                     "time",
                     "price",
                     "quantity",
-                    "trade_id"
+                    "trade_id",
+                    "side"
                 ]
             )
 
         return pd.DataFrame(data)
 
     def get_status(self):
-
-        with self._lock:
-            return dict(self.connection_status)
-
+        return self.connection_status.copy()
 
 @st.cache_resource
 def get_stream():
-
-    stream = BinanceStream()
-
-    stream.start()
-
-    return stream
+    s = CoinbaseStream()
+    s.start()
+    return s
 
 # --------------------------------------------------------------------------
 # DATA PROCESSING
@@ -307,7 +328,7 @@ def plot_candlestick_with_volume(ohlc_df: pd.DataFrame) -> go.Figure:
     )
 
     fig.update_layout(
-        title=f"BTC/USDT - Last {VISIBLE_CANDLES}s",
+        title=f"BTC/USD - Last {VISIBLE_CANDLES}s",
         template="plotly_white",
         showlegend=False,
         xaxis_rangeslider_visible=False,
@@ -327,7 +348,7 @@ def plot_candlestick_with_volume(ohlc_df: pd.DataFrame) -> go.Figure:
 # --------------------------------------------------------------------------
 
 st.title("\U0001F4C8 Real-Time Bitcoin Market Dashboard")
-st.caption("BTC/USDT - LIVE MARKET DATA (Binance Spot WebSocket)")
+st.caption("BTC/USD - LIVE MARKET DATA (Coinbase Advanced Trade WebSocket)")
 
 stream = get_stream()
 
